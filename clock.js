@@ -1,87 +1,97 @@
-// clock.js — Realtime WIB (Asia/Jakarta) dengan kalibrasi via worldtimeapi.org
-// Cara pakai (sama seperti sebelumnya):
-//   <div id="clock">-- : -- : -- : ---</div>
-//   <script src=".../clock.js"></script>
-//   <script>startJakartaClock(document.getElementById('clock'));</script>
+// clock.js — WIB realtime hanya dari API (tanpa memakai Date.now sebagai sumber waktu).
+// Sumber waktu: worldtimeapi.org. Jika API gagal -> tampil "Error" dan berhenti.
 
 (function () {
-  function pad3(n) { return String(n).padStart(3, '0'); }
+  const ZONE = 'Asia/Jakarta';
+  const API_URL = https://worldtimeapi.org/api/timezone/${ZONE};
+  const RESYNC_MS = 60 * 60 * 1000; // sinkron ulang tiap 1 jam
 
-  // Formatter HH:mm:ss khusus Asia/Jakarta (WIB, UTC+7)
-  const formatter = new Intl.DateTimeFormat('id-ID', {
-    timeZone: 'Asia/Jakarta',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false
+  // Formatter HH:mm:ss untuk WIB (Asia/Jakarta)
+  const fmt = new Intl.DateTimeFormat('id-ID', {
+    timeZone: ZONE,
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
   });
+  const pad3 = n => String(n).padStart(3, '0');
 
-  // Offset koreksi (ms) agar mendekati waktu server
-  let offsetMs = 0;
+  let baseServerMs = 0;      // "waktu server" pada momen sinkron
+  let baseMono = 0;          // performance.now() pada momen sinkron
+  let rafId = null;
+  let stopped = false;
 
-  // Anchor untuk animasi halus (minim drift)
-  const startMonotonic = (typeof performance !== 'undefined') ? performance.now() : 0;
-  const startWall = Date.now();
-
-  // Render loop
-  function render(el) {
-    const elapsed = ((typeof performance !== 'undefined') ? performance.now() : 0) - startMonotonic;
-    const t = startWall + elapsed + offsetMs; // waktu device + elapsed + koreksi offset
-    const now = new Date(t);
-
-    // Ambil HH:mm:ss dari WIB, dan ms dari Date yang sama
-    const parts = formatter.formatToParts(now);
-    let hh = '00', mm = '00', ss = '00';
-    for (const part of parts) {
-      if (part.type === 'hour') hh = part.value;
-      else if (part.type === 'minute') mm = part.value;
-      else if (part.type === 'second') ss = part.value;
-    }
-    el.textContent = ${hh} : ${mm} : ${ss} : ${pad3(now.getMilliseconds())};
-
-    (typeof requestAnimationFrame === 'function')
-      ? requestAnimationFrame(() => render(el))
-      : setTimeout(() => render(el), 16);
+  function setError(el, msg) {
+    stopped = true;
+    if (rafId && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(rafId);
+    el.textContent = 'Error';
+    // Jika ingin men-debug: el.title = msg || 'API error';
   }
 
-  // Kalibrasi ke server waktu (estimasi half RTT)
-  async function calibrateOnce() {
+  // Ambil waktu server + perkirakan half RTT -> tentukan baseline
+  async function syncFromAPI(el) {
     try {
-      const t1 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
-      const res = await fetch('https://worldtimeapi.org/api/timezone/Asia/Jakarta', {
-        cache: 'no-store'
+      const ctrl = ('AbortController' in window) ? new AbortController() : null;
+      if (ctrl) setTimeout(() => ctrl.abort(), 8000); // timeout 8s
+      const t1 = (typeof performance !== 'undefined') ? performance.now() : 0;
+
+      const res = await fetch(API_URL, {
+        cache: 'no-store',
+        signal: ctrl ? ctrl.signal : undefined,
       });
-      const t2 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
 
+      const t2 = (typeof performance !== 'undefined') ? performance.now() : 0;
       if (!res.ok) throw new Error('HTTP ' + res.status);
-      const data = await res.json();
 
-      // Ambil waktu server dalam ms
+      const data = await res.json();
       const serverMs = (typeof data.unixtime === 'number')
         ? data.unixtime * 1000
         : Date.parse(data.datetime);
 
-      // Estimasi "now di klien" saat respons diterima = serverMs + half RTT
       const halfRTT = (t2 - t1) / 2;
-      const estNow = serverMs + halfRTT;
+      baseServerMs = serverMs + halfRTT;     // estimasi "sekarang" dari sisi server saat respons tiba
+      baseMono = (typeof performance !== 'undefined') ? performance.now() : 0; // jangkar monotonic
 
-      // Koreksi offset: selisih antara estimasi server-now dan Date.now()
-      offsetMs = estNow - Date.now();
+      return true;
     } catch (e) {
-      // Gagal kalibrasi? Abaikan. Jam tetap jalan pakai device time.
-      // Bisa tambahkan console.warn jika diperlukan.
+      setError(el, e && e.message);
+      return false;
     }
   }
 
-  // Public API
-  function startJakartaClock(el) {
-    if (!(el instanceof Element)) throw new Error('startJakartaClock: parameter harus elemen DOM');
-    render(el);            // mulai render realtime
-    calibrateOnce();       // kalibrasi awal
-    // Kalibrasi ulang tiap 1 jam untuk menjaga akurasi jangka panjang
-    setInterval(calibrateOnce, 60 * 60 * 1000);
+  function render(el) {
+    if (stopped) return;
+    const nowMono = (typeof performance !== 'undefined') ? performance.now() : 0;
+    const elapsed = nowMono - baseMono;           // hanya pakai jam monotonic lokal untuk menghitung durasi
+    const t = baseServerMs + elapsed;             // waktu = baseline server + durasi monotonic
+    const d = new Date(t);
+
+    // Format HH:mm:ss dari zona WIB; ms dari objek Date yang sama
+    const parts = fmt.formatToParts(d);
+    let hh = '00', mm = '00', ss = '00';
+    for (const p of parts) {
+      if (p.type === 'hour') hh = p.value;
+      else if (p.type === 'minute') mm = p.value;
+      else if (p.type === 'second') ss = p.value;
+    }
+    el.textContent = ${hh} : ${mm} : ${ss} : ${pad3(d.getMilliseconds())};
+
+    rafId = (typeof requestAnimationFrame === 'function')
+      ? requestAnimationFrame(() => render(el))
+      : setTimeout(() => render(el), 16);
   }
 
-  // Expose ke global
+  async function startJakartaClock(el) {
+    if (!(el instanceof Element)) throw new Error('startJakartaClock: parameter harus elemen DOM');
+    // Sinkron awal WAJIB berhasil; jika gagal -> Error & berhenti.
+    const ok = await syncFromAPI(el);
+    if (!ok) return;
+    render(el);
+
+    // Sinkron ulang berkala. Jika salah satu kalibrasi ulang gagal -> Error & berhenti (sesuai permintaan).
+    setInterval(async () => {
+      if (stopped) return;
+      const ok2 = await syncFromAPI(el);
+      if (!ok2) return; // setError dipanggil di dalam syncFromAPI
+    }, RESYNC_MS);
+  }
+
   window.startJakartaClock = startJakartaClock;
 })();
