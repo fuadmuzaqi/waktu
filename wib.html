@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WIB Realtime (API Cloudflare)</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin:0; min-height:100svh; display:grid; place-items:center; 
+      font-family: system-ui,-apple-system,"Segoe UI",Roboto,Arial,"Noto Sans",sans-serif;
+      background:#fff; color:#000;
+    }
+    .wrap { width:min(1200px, 92vw); }
+    #clock {
+      font-weight:900; text-align:left; letter-spacing:.06em;
+      font-variant-numeric:tabular-nums;
+      font-size: clamp(48px, 15vw, 120px);
+      line-height: 1.05;
+      margin: 20px 0;
+    }
+    #status { font-size:14px; opacity:.7; }
+    button {
+      margin-top:8px; padding:10px 14px; border-radius:10px; border:1px solid #ddd;
+      background:#f6f6f6; cursor:pointer; font-weight:600;
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div id="clock">-- : -- : -- : ---</div>
+    <div id="status">Menyinkronkan…</div>
+    <button id="retry" type="button" aria-label="Sinkron ulang">Sinkron ulang</button>
+  </main>
+
+  <script>
+  (function () {
+    const API = 'https://fuadtm.fuad-alhabibi.workers.dev/'; // API kamu
+    const elClock = document.getElementById('clock');
+    const elStatus = document.getElementById('status');
+    const btnRetry = document.getElementById('retry');
+
+    const pad2 = n => String(n).padStart(2,'0');
+    const pad3 = n => String(n).padStart(3,'0');
+    const WIB_OFFSET = 7 * 60 * 60 * 1000; // UTC+7 (WIB, tanpa DST)
+
+    let baseServerMs = null; // epoch dari server saat sinkron (ms)
+    let mono0 = null;        // performance.now() saat sinkron
+    let rafId = null;
+    let resyncTimer = null;
+    let stopped = false;
+
+    function setStatus(msg){ elStatus.textContent = msg; }
+
+    function render(){
+      if (stopped || baseServerMs == null) return;
+      const nowMono = (performance && performance.now) ? performance.now() : Date.now();
+      const t = baseServerMs + (nowMono - mono0); // waktu berjalan dari baseline server
+      // Konversi ke WIB tanpa bergantung timezone device:
+      const dWIB = new Date(t + WIB_OFFSET);
+      const hh = pad2(dWIB.getUTCHours());
+      const mm = pad2(dWIB.getUTCMinutes());
+      const ss = pad2(dWIB.getUTCSeconds());
+      const ms = pad3(((t % 1000) + 1000) % 1000); // pastikan positif
+      elClock.textContent = ${hh} : ${mm} : ${ss} : ${ms};
+      rafId = requestAnimationFrame(render);
+    }
+
+    async function sync() {
+      setStatus('Menyinkronkan…');
+      try {
+        const ac = ('AbortController' in window) ? new AbortController() : null;
+        if (ac) setTimeout(() => ac.abort(), 8000); // timeout 8s
+
+        const t1 = performance.now ? performance.now() : Date.now();
+        const res = await fetch(API, { cache: 'no-store', signal: ac ? ac.signal : undefined });
+        const t2 = performance.now ? performance.now() : Date.now();
+
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const j = await res.json();
+        if (typeof j.epochMs !== 'number') throw new Error('Payload tidak valid');
+
+        const halfRTT = (t2 - t1) / 2;
+        baseServerMs = j.epochMs + halfRTT; // estimasi "now" saat respons tiba
+        mono0 = t2;
+
+        stopped = false;
+        cancelAnimationFrame(rafId);
+        render();
+
+        clearInterval(resyncTimer);
+        resyncTimer = setInterval(sync, 60 * 60 * 1000); // re-sync tiap 1 jam
+        setStatus('Sinkron OK');
+      } catch (e) {
+        stopped = true;
+        setStatus('Error: ' + (e && e.message ? e.message : e));
+        // Jika mau: elClock.textContent = 'Error';
+      }
+    }
+
+    btnRetry.addEventListener('click', () => { stopped = false; sync(); });
+    sync();
+  })();
+  </script>
+</body>
+</html>
